@@ -26,6 +26,6 @@
 
 ## Rules
 
-- **不执行 `git add`**：仅处理已 staged 的文件
+- **禁止执行 `git add`**：只提交用户已经 `git add` 暂存的文件。绝对不要自行执行 `git add` 添加任何文件，即使发现有 untracked 或 modified 但未 staged 的文件，也不得擅自 stage。如果没有已 staged 的文件，停止操作并提示用户先手动 `git add`
 - **Commit message**：基于实际 diff，描述做了什么以及原因
 - **Push**：推送到当前分支对应的远程分支
