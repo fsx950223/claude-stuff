@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ssh -o ConnectTimeout=10 hjbog-srdc-39.amd.com \"docker run --rm rocm/vllm-dev:nightly bash -c 'python3 -c \\\\\"import vllm; print\\(vllm.__version__\\)\\\\\" 2>/dev/null; python3 -c \\\\\"import torch; print\\(torch.__version__\\)\\\\\" 2>/dev/null; pip show triton 2>/dev/null | head -5; which rocprofv3 2>/dev/null; ls /opt/rocm/bin/rocprof* 2>/dev/null; cat /opt/rocm/.info/version 2>/dev/null; pip show aiter 2>/dev/null | head -3'\" 2>&1)",
+      "Bash(ssh -o ConnectTimeout=10 hjbog-srdc-39.amd.com \"docker run --rm rocm/vllm-dev:nightly bash -c 'pip show triton 2>/dev/null; python3 -c \\\\\"import triton; print\\(triton.__file__\\)\\\\\" 2>/dev/null; pip show pytorch-triton-rocm 2>/dev/null'\" 2>&1 | tail -20)",
+      "Bash(ssh -o ConnectTimeout=10 hjbog-srdc-39.amd.com \"docker run --rm rocm/vllm-dev:nightly bash -c 'pip show triton 2>/dev/null; python3 -c \\\\\"import triton; print\\(triton.__file__\\)\\\\\" 2>/dev/null; ls /opt/rocm/.info/version 2>/dev/null; cat /opt/rocm/.info/version 2>/dev/null; which rocprofv3'\" 2>&1 | tail -15)",
+      "Bash(ssh -o ConnectTimeout=10 hjbog-srdc-39.amd.com \"docker run --rm rocm/vllm-dev:nightly bash -c 'pip show aiter 2>/dev/null | grep -i home; python3 -c \\\\\"import aiter; print\\(aiter.__file__\\)\\\\\" 2>/dev/null; find /usr/local/lib/python3.12/dist-packages/aiter* -name PKG-INFO 2>/dev/null | head -1 | xargs head -20 2>/dev/null'\" 2>&1 | tail -15)",
+      "Bash(ssh -o ConnectTimeout=10 hjbog-srdc-39.amd.com \"docker run --rm rocm/vllm-dev:nightly bash -c 'cat /usr/local/lib/python3.12/dist-packages/aiter/.git_metadata 2>/dev/null; pip show -f aiter 2>/dev/null | head -5; find / -path \\\\\"*/aiter/setup.py\\\\\" -o -path \\\\\"*/aiter/pyproject.toml\\\\\" 2>/dev/null | head -3'\" 2>&1 | tail -15)",
+      "WebFetch(domain:github.com)",
+      "Bash(curl -sL -o /dev/null -w \"%{http_code}\" https://github.com/ROCm/aiter 2>&1)",
+      "Bash(curl -sL -o /dev/null -w \"%{http_code}\" https://github.com/vllm-project/vllm 2>&1)",
+      "Bash(git commit -s -m \"$\\(cat <<'EOF'\nfeat\\(claude\\): add Claude Code skills and local settings\n\nAdd build-rocm-image skill for building custom ROCm Docker images\nwith triton/vllm/aiter/FlyDSL, and commit-and-push skill for\nstreamlined git workflow.\n\nSigned-off-by: Claude Opus 4.6 \\(1M context\\) <noreply@anthropic.com>\nEOF\n\\)\")",
+      "Bash(git config --global user.name \"fsx950223\" && git config --global user.email \"fsx950223@outlook.com\")",
+      "Bash(git config --global --list | grep user)",
+      "Bash(git commit -s -m \"feat\\(claude\\): add skills and local settings for Claude Code\")",
+      "Bash(git push -u origin HEAD)"
+    ]
+  }
+}
