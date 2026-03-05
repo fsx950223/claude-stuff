@@ -6,7 +6,7 @@ tools: Bash
 
 # Build ROCm Development Image
 
-Build a Docker image on a remote host based on `rocm/vllm-dev:nightly` with custom triton from the `rocm-maxnreg-support-v35` branch.
+Build a Docker image on a remote host with rocm gpu access based on `rocm/vllm-dev:nightly` with custom triton from the `rocm-maxnreg-support-v35` branch.
 
 ## Arguments
 
