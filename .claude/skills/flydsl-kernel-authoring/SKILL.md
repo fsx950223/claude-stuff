@@ -15,7 +15,7 @@ FlyDSL is a Python DSL and MLIR-based compiler for writing high-performance GPU 
 ### Pipeline
 ```
 Python (@flyc.kernel/@flyc.jit)
-  -> AST Rewriting (for/if -> scf.for/scf.if)
+  -> AST Rewriting (for/if/while -> scf.for/scf.if/scf.while)
   -> MLIR Tracing (generates Fly dialect + gpu/arith/scf/memref ops)
   -> MlirCompiler.compile() (Fly -> ROCDL -> LLVM -> HSACO binary)
   -> JITCFunction (ExecutionEngine wrapper)
@@ -29,6 +29,7 @@ Python (@flyc.kernel/@flyc.jit)
 
 ### Key Source Paths
 - `python/flydsl/compiler/` - JIT compilation (jit_function.py, kernel_function.py)
+- `python/flydsl/compiler/ast_rewriter.py` - AST rewriting (for/if/while -> scf.for/scf.if/scf.while, bool ops)
 - `python/flydsl/expr/` - DSL expression API (primitive.py, derived.py, typing.py)
 - `python/flydsl/expr/primitive.py` - All layout algebra functions
 - `python/flydsl/expr/derived.py` - CopyAtom, MmaAtom, TiledCopy, TiledMma wrappers
@@ -211,6 +212,47 @@ for i in range_constexpr(N):
 
 # Runtime loop (lowered to scf.for via AST rewriting)
 for i in range(runtime_value):
+    ...
+```
+
+### If/Else Control Flow (scf.IfOp)
+
+The AST rewriter (`ReplaceIfWithDispatch`) automatically converts Python `if/else` into MLIR `scf.IfOp` when the condition could be dynamic. Two modes:
+
+**Void if/else** (no value produced — side effects only):
+```python
+# Automatically lowered to scf.IfOp (void) by AST rewriter
+if bid == 0:
+    fx.printf("block 0")
+else:
+    fx.printf("other block")
+```
+
+**Value-producing if/else** (variables assigned in both branches):
+```python
+# Automatically detected and lowered to scf.IfOp with results
+if bid == 0:
+    scale = mlir_arith.ConstantOp(i32, 2).result
+else:
+    scale = mlir_arith.ConstantOp(i32, 3).result
+# `scale` is now an scf.IfOp result — usable after the if/else
+fx.printf("scale={}", scale)
+```
+
+The AST rewriter detects variables assigned in **both** branches and:
+1. Generates branch functions that return `{"var": var, ...}`
+2. Calls `scf_if_dispatch_v(cond, then_fn, else_fn, var_names)`
+3. For dynamic conditions: uses an **insert-then-move** strategy to build `scf.IfOp` with result types
+4. For static conditions: evaluates at compile time (no MLIR emitted)
+
+**How dynamic detection works** (`_could_be_dynamic`):
+- `ast.Call` nodes (except known helpers like `dsl_and_`, `const_expr`, `isinstance`) → dynamic
+- `ast.Compare` nodes (`==`, `!=`, `<`, `>`, etc.) with any `ast.Name` operand → dynamic (because `__eq__`/`__lt__` may return MLIR Values)
+- Pure constants and Python builtins → static
+
+**Static bypass**: Use `const_expr()` to force compile-time evaluation:
+```python
+if const_expr(SOME_CONSTEXPR_FLAG):  # Always compile-time, never scf.IfOp
     ...
 ```
 
@@ -700,6 +742,18 @@ Pass raw `torch.Tensor` objects instead.
 11. **`arith.absf` does not exist**: FlyDSL does not expose `arith.absf`. Use `negf + cmpf("olt") + select` pattern instead. See Element-wise Kernel Cookbook.
 
 12. **Scalar broadcast to vector**: Use `arith.constant_vector(value, VectorType.get([width], fx.T.f32()))` to create a splat constant vector. Do NOT try to use a scalar directly with vector `mulf`/`addf` — types must match.
+
+13. **`build-fly/` stale Python files (CRITICAL)**: Tests load modules from `build-fly/python_packages/` (inserted at `sys.path[0]` by `tests/conftest.py`), NOT from `python/flydsl/`. If you edit a Python file under `python/flydsl/`, you MUST also copy it to `build-fly/python_packages/flydsl/` and clear the `.pyc` cache in both locations, otherwise tests will silently use the old version:
+    ```bash
+    cp python/flydsl/compiler/ast_rewriter.py build-fly/python_packages/flydsl/compiler/ast_rewriter.py
+    rm -f build-fly/python_packages/flydsl/compiler/__pycache__/ast_rewriter*.pyc
+    rm -f python/flydsl/compiler/__pycache__/ast_rewriter*.pyc
+    ```
+    **Symptom**: `AttributeError: type object 'X' has no attribute 'new_method'` even though the file clearly has it. Standalone `python3 -c "import X; print(hasattr(X, 'new_method'))"` returns `True` but pytest says `False`.
+
+14. **`cannot evaluate dynamic 'Boolean' as Python bool during tracing`**: The AST rewriter's `_could_be_dynamic` didn't recognize `ast.Compare` nodes (like `bid == 0`) as potentially dynamic. Fixed in `feat/if-else-values-v2` branch — Compare expressions with variable operands are now detected. If you hit this on older builds, use `const_expr()` to wrap static conditions.
+
+15. **MLIR op-movement for deferred IfOp construction**: When building `scf.IfOp` with result types, you need the types before creating the op, but the types come from executing the branch. Solution: emit then-branch ops at current insertion point, infer types, create IfOp, then `op.move_before(yield_op)` to relocate ops into the then-region. Verified APIs: `ir.Operation.move_before(other_op)`, `ir.Operation.move_after(other_op)`, `ir.Block.operations` (iterable).
 
 ---
 
