@@ -1,139 +1,351 @@
 ---
 name: kernel-trace-analysis
 description: >
-  Profile GPU kernels using rocprofv3 to collect kernel stats and instruction-level
-  traces, then analyze the trace data to identify performance bottlenecks (barrier stalls,
-  idle cycles, TA-blocked loads) and produce an optimization plan. Workflow: (1) run
-  rocprofv3 --stats to discover kernel names, (2) configure input.yaml with the target
-  kernel regex, (3) run rocprofv3 -i input.yaml to collect ATT traces, (4) parse the
-  CSV trace output to find high-cycle instructions and stall reasons, (5) produce a
-  bottleneck report with actionable optimization suggestions.
+  Profile GPU kernels using rocprofv3 to collect ATT instruction-level traces, then
+  analyze the trace data using hotspot_analyzer.py to identify top-K stall hotspots
+  (VMEM-load, VMEM-wait, LDS/SMEM-wait, barrier, MFMA stalls) mapped back to source
+  lines, and produce an actionable optimization plan.
   Usage: /kernel-trace-analysis <cmd>
+  Can also analyze an existing dispatch dir directly: /kernel-trace-analysis --dir <path>
 tools: Read,Edit,Bash,Grep,Glob,Agent,Write
-note: All analysis is done programmatically via code.json parsing. Do NOT use GUI tools (rocprof-compute-viewer, Wine, xdotool, etc.)
+note: All analysis is done programmatically via hotspot_analyzer.py + code.json. Do NOT use GUI tools.
 ---
 
 # Kernel Trace Analysis
 
-Profile and analyze GPU kernel instruction traces using `rocprofv3` to identify
-performance bottlenecks and produce an optimization plan.
+Profile and analyze GPU kernel ATT traces to identify stall hotspots and produce
+an optimization plan.
 
 ## Arguments
 
-| Argument | Required | Description |
-|----------|----------|-------------|
-| `<CMD>` | Yes | The full command to profile. Example: `python bench_pa.py --batch 32` |
+| Argument | Description |
+|----------|-------------|
+| `<CMD>` | Command to profile. Example: `python bench_pa.py --batch 32` |
+| `--dir <path>` | Skip collection; analyze existing `ui_output_agent_*_dispatch_*` directory |
+| `--topk N` | Show top-N hotspots (default: 15) |
 
-When this skill is invoked, the argument is the command to profile. Replace `<CMD>`
-below with the provided command. If no command is provided, ask the user for it.
+---
 
-## Prerequisites
+## Hotspot Analyzer Script
 
-- `rocprofv3` must be available in PATH (comes with ROCm 6.x+)
-- The input.yaml template at `~/Documents/input.yaml` (will be copied and modified)
-- Sufficient disk space for trace output (ATT traces can be large)
+**Always write this script to `/aiter/hotspot_analyzer.py` before analysis.**
+It reads a `ui_output_agent_*_dispatch_*` directory and reports top-K stall hotspots.
 
-## Workflow Overview
+```python
+"""
+GPU Kernel Hotspot Analyzer
+Reads rocprof-compute ATT trace output and identifies top-K stall hotspots.
 
-```
-Step 1: Kernel Discovery      rocprofv3 --stats --kernel-trace
-Step 2: Configure Tracing     Edit input.yaml with target kernel regex
-Step 3: Collect ATT Trace     rocprofv3 -i input.yaml -- <cmd>
-Step 4: Parse Trace Data      Read CSV files from ui_output_agent_xxx/
-Step 5: Analyze Bottlenecks   Identify barrier, idle, TA stalls
-Step 6: Report                Produce optimization plan
+Usage:
+    python hotspot_analyzer.py <dispatch_dir> [--topk N] [--mode {asm,src,both}]
+    python hotspot_analyzer.py <dispatch_dir> --topk 5 --mode src --detail --context 4
+"""
+
+import argparse
+import json
+import os
+from collections import defaultdict
+from dataclasses import dataclass, field
+
+
+@dataclass
+class Instruction:
+    asm: str
+    pc_index: int
+    source_loc: str
+    pc_addr: int
+    exec_count: int
+    total_cycles: int
+    stall_cycles: int
+    issue_cycles: int
+
+    @property
+    def stall_pct(self):
+        return 100.0 * self.stall_cycles / self.total_cycles if self.total_cycles else 0.0
+
+    @property
+    def stall_type(self):
+        asm = self.asm.lower()
+        if "s_waitcnt" in asm:
+            if "vmcnt" in asm:   return "VMEM-wait"
+            if "lgkmcnt" in asm: return "LDS/SMEM-wait"
+            if "expcnt" in asm:  return "EXP-wait"
+            return "waitcnt"
+        if "s_barrier" in asm or "s_wait_idle" in asm: return "barrier"
+        if "buffer_load" in asm or "global_load" in asm or "flat_load" in asm: return "VMEM-load"
+        if "buffer_store" in asm or "global_store" in asm: return "VMEM-store"
+        if "ds_read" in asm or "ds_write" in asm: return "LDS"
+        if "s_load" in asm or "s_store" in asm: return "SMEM"
+        if "v_mfma" in asm or "v_fma" in asm: return "MFMA/FMA"
+        return "other"
+
+
+@dataclass
+class SourceLineHotspot:
+    source_loc: str
+    total_stall_cycles: int = 0
+    total_cycles: int = 0
+    instructions: list = field(default_factory=list)
+
+    @property
+    def stall_pct(self):
+        return 100.0 * self.total_stall_cycles / self.total_cycles if self.total_cycles else 0.0
+
+    @property
+    def dominant_stall_type(self):
+        by_type = defaultdict(int)
+        for inst in self.instructions:
+            by_type[inst.stall_type] += inst.stall_cycles
+        return max(by_type, key=by_type.get) if by_type else "other"
+
+
+def load_source_map(dispatch_dir):
+    """Parse snapshots.json nested tree → {virtual_path: [source_lines]}."""
+    snap_path = os.path.join(dispatch_dir, "snapshots.json")
+    if not os.path.exists(snap_path):
+        return {}
+    with open(snap_path) as f:
+        tree = json.load(f)
+
+    path_map = {}
+    def _walk(node, prefix):
+        for key, val in node.items():
+            segment = "" if key == "/" else key
+            path = prefix.rstrip("/") + "/" + segment if segment else prefix
+            if isinstance(val, dict):
+                _walk(val, path)
+            else:
+                path_map[path] = val
+    _walk(tree, "")
+
+    source_cache = {}
+    for vpath, local_name in path_map.items():
+        local_path = os.path.join(dispatch_dir, local_name)
+        if os.path.exists(local_path):
+            with open(local_path) as f:
+                source_cache[vpath] = f.readlines()
+    return source_cache
+
+
+def get_source_snippet(source_cache, source_loc, context=3):
+    if ":" not in source_loc:
+        return []
+    path, lineno_str = source_loc.rsplit(":", 1)
+    try:
+        lineno = int(lineno_str)
+    except ValueError:
+        return []
+    lines = source_cache.get(path)
+    if not lines:
+        return []
+    start = max(0, lineno - context - 1)
+    end = min(len(lines), lineno + context)
+    return [(i + 1, lines[i].rstrip(), i + 1 == lineno) for i in range(start, end)]
+
+
+def load_instructions(dispatch_dir):
+    with open(os.path.join(dispatch_dir, "code.json")) as f:
+        data = json.load(f)
+    instructions = []
+    for row in data["code"]:
+        if not isinstance(row[2], int) or row[2] == 0:
+            continue
+        instructions.append(Instruction(
+            asm=row[0],
+            pc_index=row[2],
+            source_loc=row[3] if row[3] else "<unknown>",
+            pc_addr=row[5],
+            exec_count=row[6] if isinstance(row[6], int) else 0,
+            total_cycles=row[7] if isinstance(row[7], int) else 0,
+            stall_cycles=row[8] if isinstance(row[8], int) else 0,
+            issue_cycles=row[9] if isinstance(row[9], int) else 0,
+        ))
+    return instructions
+
+
+def aggregate_by_source(instructions):
+    by_src = {}
+    for inst in instructions:
+        loc = inst.source_loc
+        if loc not in by_src:
+            by_src[loc] = SourceLineHotspot(source_loc=loc)
+        hs = by_src[loc]
+        hs.total_stall_cycles += inst.stall_cycles
+        hs.total_cycles += inst.total_cycles
+        if inst.stall_cycles > 0:
+            hs.instructions.append(inst)
+    return sorted(by_src.values(), key=lambda x: x.total_stall_cycles, reverse=True)
+
+
+BAR_WIDTH = 30
+
+def stall_bar(pct):
+    filled = int(pct / 100 * BAR_WIDTH)
+    return f"[{'█' * filled}{'░' * (BAR_WIDTH - filled)}] {pct:5.1f}%"
+
+def fmt_cycles(n):
+    if n >= 1_000_000: return f"{n/1_000_000:.2f}M"
+    if n >= 1_000:     return f"{n/1_000:.1f}K"
+    return str(n)
+
+def print_header(title):
+    print(f"\n{'═' * 90}\n  {title}\n{'═' * 90}")
+
+
+def print_stall_type_summary(instructions, total_stall):
+    print_header("Stall Breakdown by Type")
+    by_type = defaultdict(int)
+    for inst in instructions:
+        if inst.stall_cycles > 0:
+            by_type[inst.stall_type] += inst.stall_cycles
+    print(f"  {'Type':<14}  {'Stall':>8}  Bar")
+    print(f"  {'-'*14}  {'-'*8}  {'-'*38}")
+    for stype, cycles in sorted(by_type.items(), key=lambda x: x[1], reverse=True):
+        pct = 100.0 * cycles / total_stall if total_stall else 0
+        print(f"  {stype:<14}  {fmt_cycles(cycles):>8}  {stall_bar(pct)}")
+
+
+def print_source_hotspots(hotspots, topk, total_stall):
+    print_header(f"Top-{topk} Hotspot Source Lines  (stall cycles aggregated)")
+    print(f"  {'#':>3}  {'Stall':>8}  {'%Total':>7}  {'StallBar':<38}  {'DomType':<12}  Source")
+    print(f"  {'-'*3}  {'-'*8}  {'-'*7}  {'-'*38}  {'-'*12}  {'-'*40}")
+    for rank, hs in enumerate(hotspots[:topk], 1):
+        if hs.total_stall_cycles == 0:
+            break
+        pct = 100.0 * hs.total_stall_cycles / total_stall if total_stall else 0
+        src_short = hs.source_loc[-48:] if len(hs.source_loc) > 48 else hs.source_loc
+        print(f"  {rank:>3}  {fmt_cycles(hs.total_stall_cycles):>8}  {pct:>6.2f}%  "
+              f"{stall_bar(hs.stall_pct):<38}  {hs.dominant_stall_type:<12}  {src_short}")
+
+
+def print_asm_hotspots(instructions, topk, total_stall):
+    print_header(f"Top-{topk} Hotspot Instructions  (by stall cycles)")
+    print(f"  {'#':>3}  {'Stall':>8}  {'%Total':>7}  {'Type':<12}  {'ASM':<48}  Source")
+    print(f"  {'-'*3}  {'-'*8}  {'-'*7}  {'-'*12}  {'-'*48}  {'-'*30}")
+    ranked = sorted([i for i in instructions if i.stall_cycles > 0],
+                    key=lambda x: x.stall_cycles, reverse=True)[:topk]
+    for rank, inst in enumerate(ranked, 1):
+        pct = 100.0 * inst.stall_cycles / total_stall if total_stall else 0
+        asm_short = inst.asm[:47] + "…" if len(inst.asm) > 48 else inst.asm
+        src_short = inst.source_loc[-38:] if len(inst.source_loc) > 38 else inst.source_loc
+        print(f"  {rank:>3}  {fmt_cycles(inst.stall_cycles):>8}  {pct:>6.2f}%  "
+              f"{inst.stall_type:<12}  {asm_short:<48}  {src_short}")
+
+
+def print_source_detail(hotspot, source_cache, context=3):
+    print(f"\n    ── {hotspot.source_loc}  "
+          f"(stall={fmt_cycles(hotspot.total_stall_cycles)}, {hotspot.stall_pct:.0f}% stall rate)")
+    snippet = get_source_snippet(source_cache, hotspot.source_loc, context=context)
+    if snippet:
+        print("    Source:")
+        for lineno, text, is_hot in snippet:
+            marker = ">>>" if is_hot else "   "
+            print(f"      {marker} {lineno:4d} │ {text}")
+    print("    Stalling instructions:")
+    for inst in sorted(hotspot.instructions, key=lambda x: x.stall_cycles, reverse=True)[:6]:
+        print(f"      stall={fmt_cycles(inst.stall_cycles):>7}  type={inst.stall_type:<12}  {inst.asm}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="GPU kernel hotspot analyzer")
+    parser.add_argument("dispatch_dir", help="Path to ATT dispatch output directory")
+    parser.add_argument("--topk", type=int, default=15)
+    parser.add_argument("--mode", choices=["asm", "src", "both"], default="both")
+    parser.add_argument("--detail", action="store_true",
+                        help="Show source snippet + instruction breakdown under each source hotspot")
+    parser.add_argument("--context", type=int, default=3,
+                        help="Source lines of context around hotspot (default: 3)")
+    args = parser.parse_args()
+
+    if not os.path.isdir(args.dispatch_dir):
+        print(f"Error: directory not found: {args.dispatch_dir}")
+        return 1
+
+    print(f"\nLoading: {args.dispatch_dir}")
+    instructions = load_instructions(args.dispatch_dir)
+    source_hotspots = aggregate_by_source(instructions)
+    source_cache = load_source_map(args.dispatch_dir)
+
+    total_stall  = sum(i.stall_cycles  for i in instructions)
+    total_cycles = sum(i.total_cycles  for i in instructions)
+
+    print(f"\n  Kernel:        {os.path.basename(args.dispatch_dir)}")
+    print(f"  Instructions:  {len(instructions):,}")
+    print(f"  Total cycles:  {fmt_cycles(total_cycles)}")
+    print(f"  Total stalls:  {fmt_cycles(total_stall)}  ({100*total_stall/total_cycles:.1f}% of total cycles)")
+
+    print_stall_type_summary(instructions, total_stall)
+
+    if args.mode in ("src", "both"):
+        print_source_hotspots(source_hotspots, args.topk, total_stall)
+        if args.detail:
+            for hs in source_hotspots[:min(5, args.topk)]:
+                if hs.total_stall_cycles > 0:
+                    print_source_detail(hs, source_cache, context=args.context)
+
+    if args.mode in ("asm", "both"):
+        print_asm_hotspots(instructions, args.topk, total_stall)
+
+    print()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
 ```
 
 ---
 
-## Step 1: Kernel Discovery
+## Workflow
 
-Run `rocprofv3` in stats mode to list all GPU kernels launched by the command,
-sorted by total duration:
+### Mode A: Analyze existing dispatch directory
+
+If the user provides `--dir <path>` or already has a `ui_output_agent_*_dispatch_*` directory:
 
 ```bash
-rocprofv3 --stats --kernel-trace -f csv -- <CMD> 2>&1
+# Write hotspot_analyzer.py (see above), then:
+python /aiter/hotspot_analyzer.py <dispatch_dir> --topk 15 --mode both
+python /aiter/hotspot_analyzer.py <dispatch_dir> --topk 5 --mode src --detail --context 4
 ```
 
-This produces a `kernel_trace_stats.csv` (or similar) file. Parse it to find:
-- Kernel names matching the user's area of interest
-- Total duration, call count, and average duration per kernel
-- The hottest kernels (most total GPU time)
+Skip to **Step 4: Interpret Results**.
 
-Present the kernel list to the user in a table format:
+---
+
+### Mode B: Full collection workflow
+
+#### Step 1: Kernel Discovery
+
+```bash
+touch /tmp/trace_ts
+rocprofv3 --stats --kernel-trace -f csv -- <CMD> 2>&1
+find . -maxdepth 3 -name "*stats*" -newer /tmp/trace_ts -type f 2>/dev/null
+```
+
+Parse the stats CSV and present a kernel table:
 
 | Rank | Kernel Name | Calls | Total (us) | Avg (us) | % GPU Time |
 |------|-------------|-------|------------|----------|------------|
 
-Ask the user which kernel(s) to trace if not obvious. If the user already
-specified a kernel name pattern, proceed directly.
+Ask the user which kernel to trace if not obvious.
 
-**Important**: The `--stats` output directory and file naming varies by ROCm version.
-Look for CSV files in the current directory or any newly created output directories:
-
+**Prefer `results.db`** if available — use sqlite3 for structured queries:
 ```bash
-# Find the stats output
-find . -maxdepth 3 -name "*stats*" -newer /tmp/trace_timestamp -type f 2>/dev/null
-```
-
-Create a timestamp file before profiling to identify new output:
-
-```bash
-touch /tmp/trace_timestamp
-```
-
-### 1.1 Using the rocprofv3 SQLite Database (Preferred)
-
-`rocprofv3 --kernel-trace` also produces a `results.db` SQLite database. This is often more reliable than parsing CSV files and provides structured access to kernel timing AND VGPR counts:
-
-```bash
-# Find the database
-find . -maxdepth 3 -name "results.db" -newer /tmp/trace_timestamp 2>/dev/null
-```
-
-```sql
--- Kernel timing summary
-SELECT ks.KernelName,
-       COUNT(*) as calls,
-       ROUND(AVG(kd.end - kd.start)/1000.0, 1) as avg_us,
-       ROUND(MIN(kd.end - kd.start)/1000.0, 1) as min_us,
-       ROUND(MAX(kd.end - kd.start)/1000.0, 1) as max_us
+sqlite3 results.db "
+SELECT ks.KernelName, COUNT(*) calls,
+       ROUND(AVG(kd.end-kd.start)/1000.0,1) avg_us
 FROM rocpd_kernel_dispatch kd
-JOIN rocpd_info_kernel_symbol ks ON kd.kernel_symbol_id = ks.id
-GROUP BY ks.KernelName
-ORDER BY avg_us DESC
-LIMIT 20;
-
--- VGPR allocation (arch vs accum - critical for CDNA3 occupancy analysis)
-SELECT ks.KernelName, ki.arch_vgpr_count, ki.accum_vgpr_count,
-       ki.sgpr_count, ki.lds_size
-FROM rocpd_kernel_dispatch kd
-JOIN rocpd_info_kernel_symbol ks ON kd.kernel_symbol_id = ks.id
-JOIN rocpd_info_kernel ki ON kd.kernel_id = ki.id
-WHERE ks.KernelName LIKE '%target_kernel%'
-LIMIT 5;
+JOIN rocpd_info_kernel_symbol ks ON kd.kernel_symbol_id=ks.id
+GROUP BY ks.KernelName ORDER BY avg_us DESC LIMIT 20;"
 ```
 
-### 1.2 GPU Kernel Time vs End-to-End Time (CRITICAL)
-
-**Always measure GPU kernel time via rocprofv3, not end-to-end wall-clock time.**
-
-For Triton/Gluon kernels, the CPU-side JIT dispatch overhead can be 100-200+ us per call (argument specialization, hash computation, grid calculation). For kernels with GPU time < 200us, this CPU overhead **dominates** end-to-end measurements like `triton.testing.do_bench`.
-
-A kernel change that increases GPU time by 4.5x can appear neutral in end-to-end benchmarks because the CPU overhead masks the regression. Always compare GPU kernel duration from `rocprofv3 --kernel-trace` before and after optimization.
-
----
-
-## Step 2: Configure input.yaml
-
-Copy the template input.yaml and modify `kernel_include_regex` to match the
-target kernel:
+#### Step 2: Configure input.yaml
 
 ```bash
 cp ~/Documents/input.yaml /tmp/trace_input.yaml
 ```
 
-Edit `/tmp/trace_input.yaml` to set:
+Edit `/tmp/trace_input.yaml`:
 
 ```yaml
 jobs:
@@ -152,44 +364,19 @@ jobs:
        att_buffer_size: "0x6000000"
 ```
 
-Key configuration notes:
-- `kernel_include_regex`: Use the exact kernel name or a regex pattern. For
-  Triton kernels, names often contain the function name, e.g.,
-  `paged_attention_decode_sliding_window` matches the sliding window PA kernel.
-- `kernel_iteration_range`: `"[1, [3-4]]"` means skip the first dispatch (warmup)
-  and trace dispatches 3 and 4. Adjust if the command does fewer iterations.
-- `att_target_cu: 1`: Trace a single CU to keep output manageable.
-- `att_shader_engine_mask: "0xf"`: Collect from 4 shader engines.
-- `att_simd_select: "0xf"`: Collect all 4 SIMDs on the selected CU.
-- `att_buffer_size`: 96MB per SE. Increase if trace is truncated.
+Key notes:
+- `kernel_iteration_range`: `"[1, [3-4]]"` skips warmup, traces dispatches 3-4
+- `att_buffer_size`: 96MB per SE; increase to `"0xC000000"` if truncated
+- `att_target_cu: 1`: single CU keeps output manageable
 
----
-
-## Step 3: Collect ATT Trace
-
-### Option A: Using input.yaml (recommended for full control)
+#### Step 3: Collect ATT Trace
 
 ```bash
 rocprofv3 -i /tmp/trace_input.yaml -- <CMD> 2>&1
+find . -type d -name "ui_output_agent_*" -newer /tmp/trace_ts 2>/dev/null
 ```
 
-### Option B: Using CLI flags (simpler, no yaml needed)
-
-```bash
-rocprofv3 --att \
-  --att-target-cu 1 \
-  --att-shader-engine-mask 0xf \
-  --att-simd-select 0xf \
-  --att-buffer-size 0x6000000 \
-  --kernel-include-regex "<KERNEL_NAME_PATTERN>" \
-  -o /path/to/output \
-  -- <CMD> 2>&1
-```
-
-**Note**: `--att` is a boolean flag (no value). The ATT library `librocprof-trace-decoder.so`
-must be in `/opt/rocm/lib/`. If missing, install from
-[rocprof-trace-decoder releases](https://github.com/ROCm/rocprof-trace-decoder/releases):
-
+If `rocprof-trace-decoder` library is missing:
 ```bash
 wget -q https://github.com/ROCm/rocprof-trace-decoder/releases/download/0.1.6/rocprof-trace-decoder-manylinux-2.28-0.1.6-Linux.sh
 chmod +x rocprof-trace-decoder-manylinux-2.28-0.1.6-Linux.sh
@@ -198,465 +385,210 @@ find /tmp/rtd-install -name '*.so*' -exec cp -a {} /opt/rocm/lib/ \;
 ldconfig
 ```
 
-### Output Structure
-
-Both options create a directory containing:
-
+**Output structure:**
 ```
-output_directory/
-├── ui_output_agent_<PID>_dispatch_<N>/    # Per-dispatch trace data
-│   ├── code.json                          # Per-instruction stall/idle/latency (PRIMARY)
-│   ├── occupancy.json                     # Occupancy data
-│   ├── filenames.json                     # Source file mapping
-│   ├── wstates*.json                      # Wave state data
-│   └── se*_sm*_sl*_wv*.json              # Per-wave raw traces
-├── stats_ui_output_agent_*_dispatch_*.csv # Per-dispatch stats CSV
-├── out_kernel_trace.csv                   # Kernel launch info (timing, VGPR, grid)
-├── out_*_shader_engine_*.att              # Raw ATT data per SE
-├── out_gfx942_code_object_id_*.out        # Code object binaries
-├── out_hip_api_trace.csv                  # HIP API trace
-└── out_hsa_api_trace.csv                  # HSA API trace
+ui_output_agent_<PID>_dispatch_<N>/
+├── code.json          ← PRIMARY: per-instruction stall/cycle data
+├── snapshots.json     ← source file path mapping (virtual → local filename)
+├── source_0_*.py      ← embedded source files
+├── filenames.json     ← wave file index
+├── occupancy.json     ← occupancy timeline
+└── se*_sm*_sl*_wv*.json  ← per-wave raw traces
 ```
 
-**Download strategy**: Only download the latest `ui_output_agent_*_dispatch_*` directory
-plus `out_kernel_trace.csv` and the corresponding `stats_*.csv`. The raw `.att` files and
-code objects are large and not needed for programmatic analysis.
+---
 
-The `ui_output_agent_*_dispatch_*` directories contain `code.json` with per-instruction
-stall/idle/latency data — this is the primary analysis input.
+## Step 4: Run hotspot_analyzer.py
 
-Locate the trace output:
+Write the script (see above), then run:
 
 ```bash
-find . -type d -name "ui_output_agent_*" -newer /tmp/trace_timestamp 2>/dev/null
+# Full report
+python /aiter/hotspot_analyzer.py <dispatch_dir> --topk 15 --mode both
+
+# Source-level with code context (best for optimization)
+python /aiter/hotspot_analyzer.py <dispatch_dir> --topk 5 --mode src --detail --context 4
+
+# ASM-only for instruction-level detail
+python /aiter/hotspot_analyzer.py <dispatch_dir> --mode asm --topk 20
 ```
 
 ---
 
-## Step 4: Parse Trace Data
+## Step 5: Interpret Results
 
-Read the CSV trace files and extract instruction-level timing data.
+### code.json field reference
 
-### 4.1 Extract high-cycle instructions from code.json
-
-The key analysis file is `code.json` inside each `ui_output_agent_*_dispatch_*` directory.
-This is always generated regardless of `output_format` setting:
-
-```python
-# Parse code.json
-import json
-with open('ui_output_agent_XXX_dispatch_YYY/code.json') as f:
-    data = json.load(f)
-
-header = data['header']  # "ISA, _, LineNumber, Source, Codeobj, Vaddr, Hit, Latency, Stall, Idle"
-instructions = data['code']
-# Each instruction: [isa_string, _, line_num, source_file:line, codeobj, vaddr, hit, latency, stall, idle]
-# Index:             0          1  2         3                  4       5      6    7        8      9
-
-# Top instructions by stall
-hot = sorted([i for i in instructions if i[8] > 0], key=lambda x: x[8], reverse=True)
-for inst in hot[:20]:
-    print(f"L{inst[2]:>4d}  stall={inst[8]:>6d}  idle={inst[9]:>6d}  {inst[0][:60]}  | {inst[3]}")
+Each row in `code["code"]` is:
+```
+[asm, _, pc_index, source_loc, _, pc_addr, exec_count, total_cycles, stall_cycles, issue_cycles]
+  0   1     2          3       4     5          6            7              8             9
 ```
 
-Also check:
-- `realtime.json` — per-SE clock offsets: `{"SE0": [[gfx_clock, realtime_clock], ...], ...}`
-- `se*_sm*_sl*_wv*.json` — per-wave raw trace data
-- `filenames.json` — source file mapping
-- `occupancy.json` — occupancy data
+- **col[8] `stall_cycles`**: cycles the instruction was blocked from issuing — **primary hotspot metric**
+- **col[7] `total_cycles`**: total cycles charged to this instruction across all waves
+- **col[3] `source_loc`**: `"/path/to/file.py:LINE"` — virtual path resolved via `snapshots.json`
+- **col[6] `exec_count`**: number of wave-threads that executed this instruction
 
-### 4.3 Aggregate analysis
+### snapshots.json: resolving source paths
 
-Use Python for comprehensive analysis. Key aggregations:
-
-```python
-# 1. Instruction type distribution (by total stall)
-from collections import defaultdict
-type_stats = defaultdict(lambda: {'count': 0, 'latency': 0, 'stall': 0, 'idle': 0})
-for inst in instructions:
-    op = inst[0].split()[0]
-    type_stats[op]['count'] += 1
-    type_stats[op]['stall'] += inst[8]
-    type_stats[op]['idle'] += inst[9]
-
-# 2. Source line stall breakdown
-line_stats = defaultdict(lambda: {'stall': 0, 'barrier': 0, 'waitcnt': 0, 'mfma': 0})
-for inst in instructions:
-    if inst[3]:
-        line = inst[3].split(':')[-1]
-        line_stats[line]['stall'] += inst[8]
-        if 's_barrier' in inst[0]: line_stats[line]['barrier'] += 1
-        if 's_waitcnt' in inst[0]: line_stats[line]['waitcnt'] += 1
-        if 'v_mfma' in inst[0]: line_stats[line]['mfma'] += 1
-
-# 3. Register usage estimation
-import re
-max_vgpr = max(int(m.group(1)) for inst in instructions for m in re.finditer(r'v\[?(\d+)', inst[0]))
-max_agpr = max((int(m.group(1)) for inst in instructions for m in re.finditer(r'a\[?(\d+)', inst[0])), default=0)
-print(f"VGPR: {max_vgpr+1}, AGPR: {max_agpr+1}, Total: {max_vgpr+max_agpr+2}/512")
-```
-
-### 4.4 Kernel info from out_kernel_trace.csv
-
-Parse `out_kernel_trace.csv` to get kernel metadata for the target dispatch:
-
-```python
-import csv
-with open('out_kernel_trace.csv') as f:
-    reader = csv.DictReader(f)
-    for row in reader:
-        if int(row["Dispatch_Id"]) == TARGET_DISPATCH:
-            dur = (int(row["End_Timestamp"]) - int(row["Start_Timestamp"])) / 1000
-            print(f"VGPR={row['VGPR_Count']}, Accum_VGPR={row['Accum_VGPR_Count']}")
-            print(f"Grid={row['Grid_Size_X']}x{row['Grid_Size_Y']}x{row['Grid_Size_Z']}")
-            print(f"Duration={dur:.1f} us")
-```
-
-### 4.5 Loop structure analysis
-
-Identify the main loop by looking at hit count transitions (instructions inside the loop
-have higher hit counts than prologue/epilogue):
-
-```python
-# Find loop boundaries
-prev_hit = None
-for i, inst in enumerate(instructions):
-    if inst[6] != prev_hit and inst[6] > 0:
-        print(f"Line {inst[2]:>4} (idx {i:>4}): hit={inst[6]:>6}  {inst[0][:65]}")
-        prev_hit = inst[6]
-
-# Loop iterations = loop_hit / prologue_hit (e.g., 624/208 = 3 iterations)
-```
-
-Separate stall analysis by region (prologue / main loop / epilogue) to focus optimization
-on the main loop body where most cycles are spent.
-
-### 4.6 Source line aggregation
-
-When source mapping is available (FlyDSL with `FLYDSL_DEBUG_ENABLE_DEBUG_INFO=1`, or
-Triton/Gluon kernels), aggregate stall by source line for high-level bottleneck identification:
-
-```python
-from collections import defaultdict
-src_stats = defaultdict(lambda: {'stall': 0, 'count': 0})
-for inst in instructions:
-    if inst[3] and inst[8] > 0:
-        src_stats[inst[3]]['stall'] += inst[8]
-        src_stats[inst[3]]['count'] += 1
-
-for src, s in sorted(src_stats.items(), key=lambda x: x[1]['stall'], reverse=True)[:15]:
-    print(f"  {src:<55} stall={s['stall']:>8} [{s['count']} insts]")
-```
-
-**Note**: Many instructions may map to the kernel entry line (e.g., `pa_decode_fp8.py:138`)
-because MLIR debug info scope doesn't always propagate fine-grained line numbers to
-compiler-generated instructions (address calculations, cndmask, etc.). Focus on lines with
-explicit FlyDSL/Triton operations for actionable source-level insights.
-
-### 4.7 Categorize bottleneck instructions
-
-Group the high-cycle instructions into categories:
-
-| Category | Typical Instructions | Root Cause |
-|----------|---------------------|------------|
-| **Barrier/Wait** | `s_waitcnt vmcnt(0)`, `s_barrier`, `s_waitcnt lgkmcnt(0)` | Waiting for memory or synchronization |
-| **Idle** | `s_nop`, `s_sleep`, idle cycles between instructions | Pipeline bubbles, underutilization |
-| **VMEM Load** | `buffer_load_dword`, `buffer_load_b128`, `global_load_*` | TA (Texture Addresser) blocking, cache misses |
-| **SMEM Load** | `s_load_dword*` | Scalar memory stalls |
-| **MFMA** | `v_mfma_f32_*` | Matrix compute (expected to be high if compute-bound) |
-| **LDS** | `ds_read_*`, `ds_write_*`, `ds_bpermute_*`, `ds_swizzle_*` | Shared memory bank conflicts or cross-lane reduce |
-
----
-
-## Step 5: Analyze Bottlenecks
-
-### 5.1 Barrier Stall Analysis
-
-High-cycle `s_waitcnt` and `s_barrier` instructions indicate the kernel is
-**memory-bound** -- the wavefront is stalling because data hasn't arrived yet.
-
-Check what the barrier is waiting for:
-- `s_waitcnt vmcnt(N)`: Waiting for N outstanding VMEM (global memory) loads to complete.
-  If `vmcnt(0)`, waiting for ALL loads. Root cause: load latency not hidden.
-- `s_waitcnt lgkmcnt(N)`: Waiting for LDS (shared memory) or SMEM operations.
-  Root cause: LDS bank conflicts or SMEM stalls.
-- `s_barrier`: Cross-wave synchronization. All waves in the workgroup must reach
-  this point. Root cause: workload imbalance between waves.
-
-**Optimization hints for barrier stalls**:
-1. **Prefetch / double-buffer**: Issue loads earlier to overlap with compute
-   (see `/prefetch-data-load` skill)
-2. **Reduce waitcnt strictness**: Change `vmcnt(0)` to `vmcnt(N)` where N > 0
-   if not all loads need to complete before proceeding
-3. **Increase occupancy**: More waves in flight hides memory latency
-4. **Restructure loop**: Move loads before compute in the loop body
-
-### 5.2 Idle Cycle Analysis
-
-Idle cycles (gaps between instructions, `s_nop`) indicate:
-- **Pipeline bubbles**: Dependent instructions too close together
-- **MFMA drain**: Waiting for matrix operations to complete
-- **Register dependency**: Next instruction depends on result of previous
-
-**Optimization hints for idle cycles**:
-1. **Interleave independent operations**: Put unrelated ALU work between
-   dependent instructions
-2. **Software pipelining**: Overlap iterations to fill idle slots
-3. **Adjust MFMA shape**: Smaller MFMA instructions have shorter latency but
-   lower throughput. Choose based on whether latency or throughput matters.
-
-### 5.3 TA-Blocked Load Analysis
-
-When `buffer_load_*` or `global_load_*` instructions show high cycle counts,
-the Texture Addresser (TA) unit is likely blocked:
-
-- **TA queue full**: Too many outstanding loads. Reduce the number of concurrent
-  loads or increase the gap between them.
-- **Cache thrashing**: Access pattern causes L2 cache evictions. Check for
-  non-sequential or strided access patterns.
-- **TLB misses**: Large working set causes page table walks. Ensure data locality.
-- **Cross-CU contention**: Multiple CUs competing for the same memory channels.
-
-**Optimization hints for TA-blocked loads**:
-1. **Coalesce loads**: Ensure threads access consecutive addresses to maximize
-   cache line utilization (128 bytes per transaction on CDNA3)
-2. **Vectorize loads**: Use `buffer_load_b128` (16 bytes) instead of multiple
-   smaller loads
-3. **Reduce load count in flight**: If TA is saturated, issue fewer concurrent loads
-4. **Prefetch to LDS**: Load to shared memory first, then read from shared memory
-   to avoid repeated global loads
-
-### 5.4 Cross-Wave Reduce Stall Analysis (Gluon Kernels)
-
-Gluon kernels (e.g., paged attention) often have cross-wave reduce phases (softmax max/sum) that use `ds_bpermute` → `ds_swizzle` → `ds_write LDS` → `s_barrier` → `ds_read LDS` patterns. These can dominate stall time.
-
-**Identification**: Look for clusters of `s_barrier` + `s_waitcnt lgkmcnt(0)` + `ds_*` instructions from the same source line (e.g., `:189` for softmax reduce). If the total stall in this region exceeds 30% of kernel stalls, it's a primary bottleneck.
-
-**Analysis approach**:
-1. Count barriers in the reduce region — more than 4 suggests the reduce can be optimized
-2. Check if max and sum reduce are done in separate passes (doubles barrier count)
-3. Look for `ds_write → barrier → ds_read` round-trips that could be replaced by direct `ds_bpermute`
-4. Check if useful loads (e.g., next-phase data) can be hoisted into the barrier-wait dead time
-
-**Key insight for Gluon**: You cannot eliminate `s_waitcnt` directly (compiler-inserted), but you CAN restructure the Python-level Gluon code to:
-- Merge reduce passes (max + sum → single pass)
-- Replace LDS write/read round-trips with `ds_bpermute` chains
-- Issue next-phase loads before the reduce barriers
-- See `/optimize-pa-decode-gluon` skill for specific strategies
-
-### 5.5 Register Pressure Check
-
-For gfx942 (MI308/MI300X), VGPRs are split into **two separate register files**:
-
-```
-arch_vgpr: General-purpose vector registers (VALU, VMEM, LDS ops)
-accum_vgpr (AGPR): Accumulator registers (MFMA result writeback only)
-
-Each SIMD has 256 arch_vgpr and 256 accum_vgpr slots.
-Occupancy = 256 / max(arch_vgpr, accum_vgpr) waves per SIMD.
-
-Examples:
-  arch=148, accum=148 → 256/148 = 1 wave/SIMD (max of either = 148)
-  arch=128, accum=148 → 256/148 = 1 wave/SIMD (accum is bottleneck)
-  arch=128, accum=0   → 256/128 = 2 waves/SIMD (no accum)
-  arch=256, accum=256  → 256/256 = 1 wave/SIMD
-  > 256 in either file → SPILL (critical)
-```
-
-**IMPORTANT**: `maxnreg` can force `accum_vgpr=0`, which doubles occupancy but causes MFMA results to spill through arch_vgpr. This is almost always a net regression for MFMA-heavy kernels (measured 4.5x GPU slowdown). See `/optimize-pa-decode-gluon` Section 1.2.1 for details.
-
-**How to check VGPR allocation** (from rocprofv3 database):
-```sql
-SELECT ks.KernelName, ki.arch_vgpr_count, ki.accum_vgpr_count
-FROM rocpd_kernel_dispatch kd
-JOIN rocpd_info_kernel_symbol ks ON kd.kernel_symbol_id = ks.id
-JOIN rocpd_info_kernel ki ON kd.kernel_id = ki.id
-WHERE ks.KernelName LIKE '%target_kernel%'
-LIMIT 5;
-```
-
-**From ISA trace** (less reliable, only shows registers actually used):
-```python
-import re
-max_vgpr = max(int(m.group(1)) for inst in instructions for m in re.finditer(r'v\[?(\d+)', inst[0]))
-max_agpr = max((int(m.group(1)) for inst in instructions for m in re.finditer(r'a\[?(\d+)', inst[0])), default=0)
-print(f"arch_vgpr: ~{max_vgpr+1}, accum_vgpr: ~{max_agpr+1}")
-print(f"Occupancy bottleneck: {'arch' if max_vgpr > max_agpr else 'accum'} ({max(max_vgpr, max_agpr)+1})")
-```
-
-Always report **both** arch_vgpr and accum_vgpr when analyzing traces. For prefetch feasibility, check headroom in the arch_vgpr file specifically (since prefetch buffers use arch_vgpr, not accum_vgpr).
-
-### 5.6 MFMA Utilization
-
-MFMA instructions should dominate cycle count in a well-optimized compute kernel.
-Calculate MFMA utilization:
-
-```
-MFMA% = (total MFMA cycles) / (total kernel cycles) * 100
-```
-
-- **> 80%**: Compute-bound (good for compute-heavy kernels)
-- **50-80%**: Mixed, some memory overhead
-- **< 50%**: Memory-bound, significant optimization opportunity
-- **< 20%**: Severely memory-bound, likely needs architectural changes
-
----
-
-## Step 6: Generate Report
-
-Produce a structured bottleneck report with the following sections:
-
-### Report Template
-
-```
-# Kernel Trace Analysis Report
-
-## Target Kernel
-- **Name**: <kernel name>
-- **Total Cycles**: <N>
-- **MFMA Utilization**: <X>%
-
-## Top Bottlenecks (by cycle cost)
-
-### 1. <Category>: <instruction> — <cycles> cycles (<percentage>%)
-- **Location**: PC offset 0x<addr>
-- **Root Cause**: <explanation>
-- **Impact**: <estimated cycle savings if fixed>
-- **Suggested Fix**: <specific optimization>
-
-### 2. ...
-
-## Cycle Breakdown by Category
-| Category | Total Cycles | % of Kernel | Assessment |
-|----------|-------------|-------------|------------|
-| MFMA     | ...         | ...         | compute    |
-| Barrier  | ...         | ...         | stall      |
-| VMEM     | ...         | ...         | load       |
-| Idle     | ...         | ...         | waste      |
-| SALU     | ...         | ...         | overhead   |
-| LDS      | ...         | ...         | shared mem |
-
-## Optimization Plan (Priority Order)
-
-1. **[HIGH]** <optimization> — estimated <X>% cycle reduction
-   - What: <describe the change>
-   - Why: <link to bottleneck data>
-   - How: <concrete implementation steps>
-
-2. **[MEDIUM]** ...
-
-3. **[LOW]** ...
-
-## Recommended Next Steps
-- [ ] Apply optimization #1 and re-profile
-- [ ] Verify correctness after each change
-- [ ] Compare cycle breakdown before/after
-```
-
----
-
-## Interpreting Common Patterns
-
-### Pattern: s_waitcnt vmcnt(0) with high cycles before MFMA
-
-```
-buffer_load_b128 v[...], ...          ;  12 cycles
-buffer_load_b128 v[...], ...          ;   8 cycles
-s_waitcnt vmcnt(0)                    ; 847 cycles  <-- BOTTLENECK
-v_mfma_f32_16x16x16_bf16 ...         ;  64 cycles
-```
-
-**Diagnosis**: Load latency is fully exposed. The wavefront issues loads and
-then immediately waits for them, stalling for ~847 cycles.
-
-**Fix**: Apply prefetch (double-buffer) to overlap loads with previous
-iteration's MFMA compute. Expected to reduce wait cycles by 60-90%.
-
-### Pattern: High-cycle buffer_load (TA blocked)
-
-```
-buffer_load_b128 v[...], ...          ; 523 cycles  <-- TA BLOCKED
-buffer_load_b128 v[...], ...          ; 498 cycles  <-- TA BLOCKED
-```
-
-**Diagnosis**: TA unit is backed up. Too many concurrent loads or poor access
-pattern causing cache misses.
-
-**Fix**: (1) Reduce concurrent load count, (2) check access pattern for
-coalescing, (3) consider loading to LDS with a single wavefront then broadcasting.
-
-### Pattern: s_barrier with high cycles
-
-```
-s_barrier                             ; 1200 cycles  <-- BOTTLENECK
-```
-
-**Diagnosis**: Waves within the workgroup are not arriving at the barrier at the
-same time. Some waves finish their work faster than others.
-
-**Fix**: (1) Balance work across waves, (2) check if the barrier is necessary,
-(3) reduce workgroup size if only a few waves are slow.
-
-### Pattern: Idle/nop between MFMA instructions
-
-```
-v_mfma_f32_16x16x16_bf16 ...         ;  64 cycles
-s_nop 7                              ;  32 cycles  <-- IDLE
-s_nop 7                              ;  32 cycles  <-- IDLE
-v_mfma_f32_16x16x16_bf16 ...         ;  64 cycles
-```
-
-**Diagnosis**: Pipeline bubbles between MFMA instructions. The second MFMA
-depends on the result of the first, or there's insufficient interleaved work.
-
-**Fix**: (1) Interleave VMEM loads or SALU work between MFMAs, (2) restructure
-to allow independent MFMA chains, (3) consider using larger MFMA shapes to
-reduce instruction count.
-
----
-
-## FlyDSL Source-to-Assembly Mapping
-
-FlyDSL kernels support source-to-assembly mapping in rocprofv3 ATT traces, enabling the same
-`code.json` source annotations as Triton/Gluon kernels. This requires:
-
-1. **`FLYDSL_DEBUG_ENABLE_DEBUG_INFO=1`** (default: true) — enables the `ensure-debug-info-scope-on-llvm-func` MLIR pass and `-g` flag
-2. The pass converts MLIR `loc()` metadata into LLVM DWARF debug info (`DISubprogram`, `.debug_line`)
-3. rocprofv3 reads `.debug_line` from the HSACO binary to produce source mappings
-
-**Verification**: In `code.json`, each instruction entry has a source field (index 3):
+`snapshots.json` encodes a nested dict tree mapping virtual paths to local filenames:
 ```json
-["s_load_dwordx8 s[8:15], s[0:1], 0x18", 0, 1, "/FlyDSL/kernels/pa_decode_fp8.py:123", ...]
+{"/": {"FlyDSL": {"kernels": {"pa_decode_sw_fp8_ps.py": "source_0_pa_decode_sw_fp8_ps.py"}}}}
+```
+Flatten recursively: `/FlyDSL/kernels/pa_decode_sw_fp8_ps.py` → `source_0_pa_decode_sw_fp8_ps.py`
+
+### Stall type classification
+
+| Type | Instructions | Root Cause |
+|------|-------------|------------|
+| `VMEM-load` | `buffer_load_*`, `global_load_*` | Load itself stalled (VMEM queue full or back-pressure from no compute to hide behind) |
+| `VMEM-wait` | `s_waitcnt vmcnt(N)` | Waiting for outstanding VMEM loads to complete |
+| `LDS/SMEM-wait` | `s_waitcnt lgkmcnt(N)` | Waiting for LDS or SMEM ops |
+| `barrier` | `s_barrier` | Cross-wave sync — slowest wave dominates |
+| `MFMA/FMA` | `v_mfma_*` | MFMA dependency chain (RAW hazard) |
+| `LDS` | `ds_read_*`, `ds_write_*` | LDS access latency |
+
+### Common hotspot patterns
+
+#### Pattern 1: V/K loads inside MFMA loop → very high stall rate (80–95%)
+
+```python
+# BAD: load and MFMA alternate — only 1 MFMA of hiding time
+for k_step in range_constexpr(QKHELOOP * 2):
+    if k_step % 2 == 0:
+        v_data = buffer_ops.buffer_load(...)   # stall_rate ~92%
+    acc = rocdl.mfma_f32_16x16x32_fp8_fp8(...)
+
+# GOOD: batch all loads before the MFMA loop
+for td in range_constexpr(TLOOP):
+    v_prefetch[td] = [buffer_ops.buffer_load(...) for _ in range_constexpr(QKHELOOP)]
+
+for td in range_constexpr(TLOOP):
+    for k_step in range_constexpr(QKHELOOP * 2):
+        acc = rocdl.mfma_f32_16x16x32_fp8_fp8(...)   # entire QK MFMA hides VMEM latency
+    v_results[td] = v_prefetch[td]   # already in registers
 ```
 
-**If source mappings are missing** (source field is empty `""`):
-- Check that `FLYDSL_DEBUG_ENABLE_DEBUG_INFO` is not set to `0`/`false`
-- Verify the `ensure-debug-info-scope-on-llvm-func` pass is in the pipeline (check `FLYDSL_DUMP_IR=1` output for stage `14_ensure_debug_info_scope_on_llvm_func`)
-- Verify `.loc`/`.file` directives exist in `final_isa.s` (dump with `FLYDSL_DUMP_IR=1`)
-- The pass must run AFTER `reconcile-unrealized-casts` and BEFORE `gpu-module-to-binary`
+#### Pattern 2: Sequential loads with no compute → VMEM queue saturation
 
-**How it compares to Triton**: Triton uses `passes.llvmir.add_di_scope(pm)` (a custom C++ pass in
-`/triton/lib/Target/LLVMIR/LLVMDIScopePass.cpp`). FlyDSL uses MLIR's standard
-`ensure-debug-info-scope-on-llvm-func` pass which is functionally equivalent.
-Both convert MLIR source locations into LLVM `DISubprogramAttr` metadata.
+```python
+# BAD: all loads back-to-back, no compute interleaved
+for td in range_constexpr(TLOOP):
+    for qkhe in range_constexpr(QKHELOOP):
+        k4 = buffer_ops.buffer_load(k_rsrc, ka_dw, ...)   # queue fills up
+
+# GOOD: prefetch next tile's K loads during current tile's MFMA computation
+```
+
+#### Pattern 3: LDS prob reads immediately before PV MFMA → lgkmcnt stall
+
+```python
+# BAD: LDS reads and MFMA in same loop
+for vhe in ...:
+    for vt in ...:
+        p_i64 = lds_read(...)    # issued here
+        tmp = mfma(v_i64, p_i64, ...)   # immediately consumed → lgkmcnt stall
+
+# GOOD: batch all LDS reads first, then all MFMAs
+for vhe in ...:
+    for vt in ...:
+        p_i64s.append(lds_read(...))    # all LDS reads issued first
+
+for vhe in ...:
+    for vt in ...:
+        tmp = mfma(v_i64s[...], p_i64s[...], ...)   # LDS data already ready
+```
+
+#### Pattern 4: Scale loads too close to usage
+
+```python
+# BAD: scale load and usage separated by only TLOOP MFMAs
+for td in range_constexpr(TLOOP):
+    k_scale = buffer_ops.buffer_load(ks_rsrc, ...)   # issued here
+# ... small compute gap ...
+    result = acc * k_scale   # used too soon → stall
+
+# GOOD: issue scale loads at the very beginning of the block,
+# before K loads, to maximise latency hiding distance
+```
+
+#### Pattern 5: Hotspot attributed to kernel entry line
+
+When `@flyc.kernel` / kernel decorator line appears as the top hotspot with a mix of
+VMEM-wait + barrier stall types — this is a **debug info aggregation artifact**.
+MLIR/compiler-generated instructions (address arithmetic, cndmask, prologue setup) map
+to the outermost scope line. Ignore this line; focus on lines with explicit user ops.
+
+### Register pressure check (CDNA3 / gfx942)
+
+CDNA3 has two separate register files: `arch_vgpr` (VALU/VMEM) and `accum_vgpr` (MFMA results).
+Occupancy = `256 / max(arch_vgpr, accum_vgpr)`.
+
+```bash
+sqlite3 results.db "
+SELECT ks.KernelName, ki.arch_vgpr_count, ki.accum_vgpr_count, ki.lds_size
+FROM rocpd_kernel_dispatch kd
+JOIN rocpd_info_kernel_symbol ks ON kd.kernel_symbol_id=ks.id
+JOIN rocpd_info_kernel ki ON kd.kernel_id=ki.id LIMIT 5;"
+```
+
+Or estimate from ISA trace:
+```python
+import re, json
+with open("code.json") as f: code = json.load(f)["code"]
+asms = [r[0] for r in code]
+max_vgpr = max((int(m.group(1)) for a in asms for m in re.finditer(r'\bv\[?(\d+)', a)), default=0)
+max_agpr = max((int(m.group(1)) for a in asms for m in re.finditer(r'\ba\[?(\d+)', a)), default=0)
+print(f"arch_vgpr ~{max_vgpr+1}, accum_vgpr ~{max_agpr+1}, occupancy ~{256//max(max_vgpr+1,max_agpr+1,1)} waves/SIMD")
+```
+
+**Warning**: `maxnreg` forcing `accum_vgpr=0` doubles occupancy but causes MFMA spills through
+arch_vgpr — measured 4.5× GPU slowdown. Do not use `maxnreg` for MFMA-heavy kernels.
+
+---
+
+## Step 6: Optimization Plan
+
+After running `hotspot_analyzer.py --detail`, produce a prioritized plan:
+
+```
+## Stall Summary
+- Total stalls: X cycles (Y% of kernel)
+- Top stall type: VMEM-load (Z%)
+
+## Hotspot Analysis
+
+### #1 :LINE  stall=XK (N%)  VMEM-load  stall_rate=92%
+Root cause: buffer_load inside QK MFMA loop — only 1 MFMA of hiding time.
+Fix: Move all V loads before the QK MFMA loop.
+Estimated gain: ~20% kernel cycle reduction.
+
+### #2 :LINE  stall=XK (N%)  VMEM-load  stall_rate=80%
+Root cause: K loads sequential with no compute interleaved.
+Fix: Prefetch next tile's K during current tile's MFMA (double-buffer pattern).
+See /prefetch-data-load skill.
+
+### #3 ...
+
+## Priority Order
+1. [HIGH]  Fix V-load position (24% of all stalls, easy refactor)
+2. [HIGH]  K-load cross-tile prefetch (8% of stalls, needs _process_block restructure)
+3. [MED]   Move scale loads earlier (8% of stalls, trivial move)
+4. [LOW]   Batch LDS reads before PV MFMA (4% of stalls, loop split)
+```
+
+---
 
 ## Error Handling
 
-- If `rocprofv3` is not found: check `which rocprofv3` and suggest `export PATH=/opt/rocm/bin:$PATH`
-- If no GPU is available: check `rocm-smi` output
-- If trace output is empty: the kernel may not have been dispatched. Check kernel_include_regex.
-- If trace is truncated: increase `att_buffer_size` (e.g., `"0xC000000"` for 192MB)
-- If `kernel_iteration_range` doesn't match: the command may run fewer iterations. Try `"[0, [1-2]]"`
-- If permission denied: `rocprofv3` may require `sudo` or the user to be in the `video` group
-- If `rocprof-trace-decoder library path not found`: install the decoder library (see Step 3 above)
-- If `--advanced-thread-trace <file>` fails with "invalid truth value": `--att` is a boolean flag, use `-i input.yaml` for file-based config or `--att` with separate `--att-*` CLI flags
-- If `--stats` fails with "No tracing options enabled": add `--kernel-trace` before `--stats`
-- If `INVALID_SHADER_DATA` error: aqlprofile and decoder versions are incompatible. Update both.
-
-## Output
-
-After analysis, provide:
-1. The full bottleneck report (as described in Step 6)
-2. A prioritized optimization plan with concrete steps
-3. Estimated performance improvement for each optimization
-4. Suggested follow-up profiling to validate improvements
+| Error | Fix |
+|-------|-----|
+| `rocprof-trace-decoder library path not found` | Install decoder .so (see Step 3) |
+| Trace output empty | Check `kernel_include_regex` matches exactly |
+| Trace truncated | Increase `att_buffer_size` to `"0xC000000"` |
+| `kernel_iteration_range` mismatch | Adjust range; try `"[0, [1-2]]"` |
+| `INVALID_SHADER_DATA` | aqlprofile/decoder version mismatch — update both |
+| Source loc all `""` | Set `FLYDSL_DEBUG_ENABLE_DEBUG_INFO=1`; check `-g` flag in compile pipeline |
+| Top hotspot is kernel decorator line | Debug info artifact — skip it, focus on op lines |
+| `--att` flag error | `--att` is boolean, no value; use `-i input.yaml` for full config |
