@@ -28,7 +28,7 @@ an optimization plan.
 
 ## Hotspot Analyzer Script
 
-**Always write this script to `/aiter/hotspot_analyzer.py` before analysis.**
+**Always write this script to `/tmp/hotspot_analyzer.py` before analysis.**
 It reads a `ui_output_agent_*_dispatch_*` directory and reports top-K stall hotspots.
 
 ```python
@@ -304,8 +304,8 @@ If the user provides `--dir <path>` or already has a `ui_output_agent_*_dispatch
 
 ```bash
 # Write hotspot_analyzer.py (see above), then:
-python /aiter/hotspot_analyzer.py <dispatch_dir> --topk 15 --mode both
-python /aiter/hotspot_analyzer.py <dispatch_dir> --topk 5 --mode src --detail --context 4
+python /tmp/hotspot_analyzer.py <dispatch_dir> --topk 15 --mode both
+python /tmp/hotspot_analyzer.py <dispatch_dir> --topk 5 --mode src --detail --context 4
 ```
 
 Skip to **Step 4: Interpret Results**.
@@ -404,13 +404,13 @@ Write the script (see above), then run:
 
 ```bash
 # Full report
-python /aiter/hotspot_analyzer.py <dispatch_dir> --topk 15 --mode both
+python /tmp/hotspot_analyzer.py <dispatch_dir> --topk 15 --mode both
 
 # Source-level with code context (best for optimization)
-python /aiter/hotspot_analyzer.py <dispatch_dir> --topk 5 --mode src --detail --context 4
+python /tmp/hotspot_analyzer.py <dispatch_dir> --topk 5 --mode src --detail --context 4
 
 # ASM-only for instruction-level detail
-python /aiter/hotspot_analyzer.py <dispatch_dir> --mode asm --topk 20
+python /tmp/hotspot_analyzer.py <dispatch_dir> --mode asm --topk 20
 ```
 
 ---
