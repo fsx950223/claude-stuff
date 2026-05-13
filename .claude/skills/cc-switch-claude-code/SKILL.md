@@ -129,6 +129,13 @@ python3 .claude/skills/cc-switch-claude-code/scripts/openai_to_anthropic_proxy.p
 
 It listens on `127.0.0.1:15721`, reads upstream settings from `~/.claude/settings.json`, and forwards Claude Code `/v1/messages` requests to AMD OpenAI `/chat/completions`.
 
+The bridge supports Claude Code tools by translating:
+
+- Anthropic `tools` to OpenAI function tools.
+- Anthropic assistant `tool_use` to OpenAI assistant `tool_calls`.
+- Anthropic user `tool_result` to OpenAI `tool` messages.
+- OpenAI assistant `tool_calls` back to Anthropic assistant `tool_use`.
+
 Direct bridge test:
 
 ```bash
@@ -157,6 +164,14 @@ Claude Code test:
 claude -p "hi" --dangerously-skip-permissions < /dev/null
 ```
 
+Claude Code tool test:
+
+```bash
+claude -p "Use Bash to run pwd and report the exact output only." \
+  --allowedTools "Bash(pwd)" \
+  --dangerously-skip-permissions < /dev/null
+```
+
 `cc-switch` health test:
 
 ```bash
@@ -167,6 +182,7 @@ Passing criteria:
 
 - Direct bridge test returns HTTP 200 and an Anthropic-style JSON message.
 - `claude -p "hi"` exits with code 0 and prints a greeting.
+- The Bash tool test prints the current working directory.
 - `cc-switch provider stream-check` reports `Status: operational`, `HTTP: 200`, `Retries: 0`.
 
 ## Debug Notes
