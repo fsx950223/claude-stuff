@@ -2,40 +2,42 @@
 
 ## Overview
 
-为已 `git add` 暂存的文件生成 commit，并 push 到当前分支。在 `git commit` 之前必须先执行 `/format-code`。格式化后如果原本已 staged 的文件被 formatter 改动，可以只对这些原本 staged 的文件重新执行 `git add` 后继续 commit/push；不得添加其它未 staged 或 untracked 文件。
+Create a commit from files that are already staged with `git add`, then push it to the current branch with `git push`. Always run `/format-code` before `git commit`. If formatting modifies files that were already staged, re-stage only those originally staged files before continuing; never add other unstaged or untracked files.
 
 ## Steps
 
-1. **检查暂存状态**
-   - 运行 `git status` 确认有已暂存文件
-   - 若无 staged 文件，提示用户先执行 `git add` 再运行此命令
-   - 记录当前 staged 文件列表：`git diff --cached --name-only`
-   - 如果 staged 文件在格式化前已经同时存在 unstaged 改动（例如 `git status --short` 显示 `MM <file>`），停止并提示用户先手动整理/暂存这些文件；否则后续 `git add <file>` 会把格式化前已有的未暂存改动也带入 commit
+1. **Check staged state**
+   - Run `git status` and confirm that at least one file is staged.
+   - If there are no staged files, tell the user to run `git add` first, then stop.
+   - Record the current staged file list with `git diff --cached --name-only`.
+   - If any staged file already has unstaged changes before formatting, stop and ask the user to sort out staging manually. For example, `git status --short` showing `MM <file>` means a later `git add <file>` would mix pre-existing unstaged edits into the commit.
 
-2. **在 commit 前执行 `/format-code`**
-   - 调用 `/format-code`，先格式化当前 staged/modified 的代码
-   - 格式化完成后重新运行 `git status`
-   - 如果格式化导致原本 staged 的文件重新变成 modified/unstaged，只对步骤 1 记录的原本 staged 文件执行 `git add <file>`，然后继续流程
-   - 不要 stage 不在步骤 1 staged 列表中的文件，即使它们也被 `/format-code` 改动
+2. **Run `/format-code` before committing**
+   - Invoke `/format-code` to format the currently staged/modified code.
+   - After formatting, run `git status` again.
+   - If formatting made originally staged files modified/unstaged, run `git add <file>` only for files recorded in step 1, then continue.
+   - Do not stage files that were not in the step 1 staged list, even if `/format-code` changed them.
 
-3. **查看变更内容**
-   - 运行 `git diff --cached` 查看 staged 的 diff
-   - 根据实际变更生成简洁、准确的 commit message
+3. **Review the staged changes**
+   - Run `git diff --cached` to inspect the staged diff.
+   - Generate a concise, accurate commit message from the actual staged changes.
 
-4. **生成并执行 commit**
-   - 基于 diff 内容生成 commit message
-   - 格式：`git commit -s -m "type(scope): description"`（`-s` 添加 Signed-off-by）
-   - 示例：`git commit -s -m "fix(pa): correct sliding window mask in decode kernel"`
-   - 规则：≤72 字符、祈使语气（fix/add/update）、首字母大写、句末无句号
+4. **Create the commit**
+   - Generate the commit message from the staged diff.
+   - Use this format: `git commit -s -m "type(scope): Description"` (`-s` adds `Signed-off-by`).
+   - Example: `git commit -s -m "fix(pa): Correct sliding window mask in decode kernel"`
+   - Message rules: 72 characters or fewer, imperative mood (`Fix` / `Add` / `Update`), capitalized description, no trailing period.
 
-5. **Push 到当前分支**
-   - 运行 `git push -u origin HEAD` 或 `git push -u origin $(git branch --show-current)`
-   - 若 push 被拒绝（远程有新提交），执行 `git pull --rebase && git push`
+5. **Push to the current branch with `git`**
+   - Record the branch name with `git branch --show-current`.
+   - If the current branch already has an upstream, run `git push`.
+   - If the branch has no upstream, run `git push -u origin HEAD`.
+   - If the push is rejected because the remote branch has new commits, run `git pull --rebase`, then retry the same `git push` command once.
 
 ## Rules
 
-- **限制 `git add` 范围**：默认只提交用户已经 `git add` 暂存的文件。唯一允许自动执行 `git add` 的情况是：`/format-code` 改动了步骤 1 记录的原本 staged 文件；此时只能 `git add` 这些原本 staged 的文件。绝对不要添加新文件、untracked 文件、或任何不在原 staged 列表中的 modified 文件
-- **先格式化再 commit**：在生成 `git diff --cached` 和 commit message 之前，必须先执行 `/format-code`
-- **防止混入旧的 unstaged 改动**：如果某个 staged 文件在运行 `/format-code` 前已经有 unstaged 改动，停止并提示用户先手动整理，因为自动 `git add` 无法区分旧改动和格式化改动
-- **Commit message**：基于实际 diff，描述做了什么以及原因
-- **Push**：推送到当前分支对应的远程分支
+- **Limit `git add` scope**: By default, commit only files the user already staged with `git add`. The only allowed automatic `git add` is re-staging files that were recorded as staged in step 1 and then changed by `/format-code`. Never add new files, untracked files, or modified files outside the original staged list.
+- **Format before commit**: Always run `/format-code` before generating `git diff --cached` and the commit message.
+- **Avoid mixing old unstaged edits**: If a staged file already has unstaged changes before `/format-code`, stop and ask the user to resolve staging manually because automatic `git add` cannot distinguish old unstaged edits from formatting edits.
+- **Commit message**: Base the message on the actual staged diff and describe the purpose of the change.
+- **Push**: Push to the current branch with `git push`; use `git push -u origin HEAD` when the branch has no upstream. Do not require GitHub CLI for pushing.
