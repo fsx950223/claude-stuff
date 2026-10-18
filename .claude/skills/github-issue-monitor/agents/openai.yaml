@@ -1,0 +1,4 @@
+interface:
+  display_name: "GitHub Issue Monitor"
+  short_description: "Monitor trusted issue requests and verify task results"
+  default_prompt: "Use $github-issue-monitor to set up authorized issue monitoring, sequential task delivery, and verified result comments."
