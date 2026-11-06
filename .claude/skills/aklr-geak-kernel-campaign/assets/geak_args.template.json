@@ -1,0 +1,8 @@
+{
+ "kernel_path": "/abs/path/to/task_dir",
+ "workflow_dir": "/abs/path/to/GEAK/kernel_workflow",
+ "budget": 4,
+ "gpu_ids": "__GPU__",
+ "exp_root": "/abs/path/to/geak_exp",
+ "task": "Optimize <kernel> for the scored workloads in program.md (score = geomean of baseline/candidate latency from scripts/task_runner.py performance). Read notes/README.md first if present. Correctness = every workload of scripts/task_runner.py correctness must pass. Edit only <candidate dir>/. Use only GPU __GPU__; the other GPUs belong to other users. Keep other architectures' behaviour unchanged."
+}
