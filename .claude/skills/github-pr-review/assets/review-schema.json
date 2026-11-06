@@ -1,0 +1,40 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict", "summary", "validation_sufficient", "findings", "tests", "limitations"],
+  "properties": {
+    "verdict": {"type": "string", "enum": ["APPROVE", "REQUEST_CHANGES", "COMMENT"]},
+    "summary": {"type": "string"},
+    "validation_sufficient": {"type": "boolean"},
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["priority", "title", "path", "line", "explanation"],
+        "properties": {
+          "priority": {"type": "string", "enum": ["P0", "P1", "P2", "P3"]},
+          "title": {"type": "string"},
+          "path": {"type": "string"},
+          "line": {"type": "integer", "minimum": 1},
+          "explanation": {"type": "string"}
+        }
+      }
+    },
+    "tests": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["host", "command", "result", "evidence"],
+        "properties": {
+          "host": {"type": "string"},
+          "command": {"type": "string"},
+          "result": {"type": "string", "enum": ["PASS", "FAIL", "SKIP"]},
+          "evidence": {"type": "string"}
+        }
+      }
+    },
+    "limitations": {"type": "array", "items": {"type": "string"}}
+  }
+}

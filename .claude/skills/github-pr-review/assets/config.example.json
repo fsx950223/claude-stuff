@@ -1,0 +1,15 @@
+{
+  "github_host": "github.com",
+  "github_login": "YOUR_GITHUB_LOGIN",
+  "repositories": ["ROCm/aiter"],
+  "review_requested": true,
+  "assigned": true,
+  "execution_authorized": false,
+  "publication_authorized": false,
+  "publish_reviews": false,
+  "review_backend": "codex",
+  "timezone": "Asia/Shanghai",
+  "daily_time": "09:00",
+  "pr_timeout_seconds": 2700,
+  "test_environments": {}
+}
