@@ -1,0 +1,30 @@
+source_file_path:
+- pa_src/pa_decode.py
+- pa_src/kernels/pa_decode_kernel.py
+- pa_src/kernels/pa_decode_plan.py
+- pa_src/kernels/pa_decode_reduce.py
+- pa_src/kernels/pa_decode/__init__.py
+- pa_src/kernels/pa_decode/context.py
+- pa_src/kernels/pa_decode/op_epilog.py
+- pa_src/kernels/pa_decode/op_gemm.py
+- pa_src/kernels/pa_decode/op_lds.py
+- pa_src/kernels/pa_decode/op_merge.py
+- pa_src/kernels/pa_decode/op_softmax.py
+- pa_src/kernels/pa_decode/pipeline.py
+- pa_src/kernels/pa_decode/traits.py
+target_kernel_functions:
+- pa_decode
+compile_command:
+- python3 scripts/task_runner.py compile
+correctness_command:
+- python3 scripts/task_runner.py correctness
+performance_command:
+- python3 scripts/task_runner.py performance
+task_type: flydsl
+prompt:
+  source_code: null
+  instructions: >-
+    Read program.md first. pa_src/ is the candidate: aiter's FlyDSL paged-attention decode for gfx1250.
+    scripts/, config.yaml, program.md, the immutable base checkout and the pristine-output store
+    are the measurement and must not be edited.
+  cheatsheet: null
